@@ -7,9 +7,64 @@ from sentence_transformers import SentenceTransformer
 import sklearn.cluster
 import numpy as np
 from collections import defaultdict
+import re
 
 class Command(BaseCommand):
     help = "Nightly error clustering & configuration pattern analysis"
+
+    def _parse_packages(self, packages):
+        """
+        Parse packages from either dict or list format
+        Returns: dict of {package_name: version}
+        """
+        if not packages:
+            return {}
+        
+        if isinstance(packages, dict):
+            # Already in the right format
+            return packages
+        
+        elif isinstance(packages, list):
+            # Parse list format like ["build==1.2.2.post1", "certifi==2025.6.15", ...]
+            parsed_packages = {}
+            for pkg_spec in packages:
+                if isinstance(pkg_spec, str) and '==' in pkg_spec:
+                    # Handle "package==version" format
+                    parts = pkg_spec.split('==', 1)
+                    if len(parts) == 2:
+                        pkg_name, pkg_version = parts
+                        parsed_packages[pkg_name] = pkg_version
+                elif isinstance(pkg_spec, str) and '>=' in pkg_spec:
+                    # Handle "package>=version" format
+                    parts = pkg_spec.split('>=', 1)
+                    if len(parts) == 2:
+                        pkg_name, pkg_version = parts
+                        parsed_packages[pkg_name] = f">={pkg_version}"
+                elif isinstance(pkg_spec, str) and '<=' in pkg_spec:
+                    # Handle "package<=version" format
+                    parts = pkg_spec.split('<=', 1)
+                    if len(parts) == 2:
+                        pkg_name, pkg_version = parts
+                        parsed_packages[pkg_name] = f"<={pkg_version}"
+                elif isinstance(pkg_spec, str) and '>' in pkg_spec:
+                    # Handle "package>version" format
+                    parts = pkg_spec.split('>', 1)
+                    if len(parts) == 2:
+                        pkg_name, pkg_version = parts
+                        parsed_packages[pkg_name] = f">{pkg_version}"
+                elif isinstance(pkg_spec, str) and '<' in pkg_spec:
+                    # Handle "package<version" format
+                    parts = pkg_spec.split('<', 1)
+                    if len(parts) == 2:
+                        pkg_name, pkg_version = parts
+                        parsed_packages[pkg_name] = f"<{pkg_version}"
+                elif isinstance(pkg_spec, str):
+                    # Just package name without version
+                    parsed_packages[pkg_spec] = "unknown"
+            
+            return parsed_packages
+        
+        return {}
 
     def handle(self, *args, **opts):
         start_time = time.time()
@@ -22,16 +77,30 @@ class Command(BaseCommand):
             self.stdout.write("No error data to analyze")
             return
             
+        total_beacons = error_beacons.count()
+        self.stdout.write(f"Found {total_beacons} total error beacons")
+        
         # Extract error signatures and get environment data
         error_texts = []
         beacon_env_data = []
         
+        # Deduplicate beacons: same error_sig + env_hash = same error occurrence
+        seen_errors = set()
+        duplicates_filtered = 0
+        
         for beacon in error_beacons:
-            text = ""
-            if beacon.error_sig:
-                text += beacon.error_sig + " "
-            if beacon.trace:
-                text += beacon.trace
+            # Create unique key for this error + environment combination
+            error_key = f"{beacon.error_sig or ''}:{beacon.env_hash}"
+            
+            if error_key in seen_errors:
+                # Skip duplicate error from same environment
+                duplicates_filtered += 1
+                continue
+            seen_errors.add(error_key)
+            
+            # Use error_sig directly since it's already the last line of the traceback
+            text = beacon.error_sig or "unknown"
+            
             if text.strip():
                 error_texts.append(text.strip())
                 
@@ -51,6 +120,9 @@ class Command(BaseCommand):
             self.stdout.write("No error data with environment information")
             return
             
+        self.stdout.write(f"Filtered out {duplicates_filtered} duplicate beacons")
+        self.stdout.write(f"Processing {len(beacon_env_data)} unique errors")
+        
         # Clear old analysis data
         ErrorCluster.objects.all().delete()
         ConfigPattern.objects.all().delete()
@@ -133,7 +205,7 @@ class Command(BaseCommand):
         )
         
         self.stdout.write(f"Analysis complete!")
-        self.stdout.write(f"  - Analyzed {len(beacon_env_data)} errors")
+        self.stdout.write(f"  - Analyzed {len(beacon_env_data)} unique errors (deduplicated)")
         self.stdout.write(f"  - Created {clusters_created} clusters")
         self.stdout.write(f"  - Found {patterns_created} significant config patterns")
         self.stdout.write(f"  - Duration: {analysis_duration:.2f} seconds")
@@ -158,10 +230,22 @@ class Command(BaseCommand):
             # OS info
             config_stats['os_info'][env.os_info] += 1
             
-            # Package versions (from JSON)
-            if env.packages:
-                for pkg_name, pkg_version in env.packages.items():
-                    config_stats[f'packages.{pkg_name}'][str(pkg_version)] += 1
+            # Package versions - parse both dict and list formats
+            parsed_packages = self._parse_packages(env.packages)
+            for pkg_name, pkg_version in parsed_packages.items():
+                config_stats[f'packages.{pkg_name}'][str(pkg_version)] += 1
+            
+            # Environment variables - parse JSON field
+            env_vars = env.env_vars
+            if env_vars and isinstance(env_vars, dict):
+                for env_var_name, env_var_value in env_vars.items():
+                    # Skip very long values or sensitive data
+                    if len(str(env_var_value)) > 200:
+                        continue
+                    # Skip common sensitive environment variables
+                    if env_var_name.lower() in ['password', 'secret', 'key', 'token', 'auth']:
+                        continue
+                    config_stats[f'env_vars.{env_var_name}'][str(env_var_value)] += 1
         
         # Convert to rates
         global_rates = {}
@@ -192,10 +276,22 @@ class Command(BaseCommand):
             # OS info
             cluster_configs['os_info'][env.os_info] += 1
             
-            # Package versions
-            if env.packages:
-                for pkg_name, pkg_version in env.packages.items():
-                    cluster_configs[f'packages.{pkg_name}'][str(pkg_version)] += 1
+            # Package versions - parse both dict and list formats
+            parsed_packages = self._parse_packages(env.packages)
+            for pkg_name, pkg_version in parsed_packages.items():
+                cluster_configs[f'packages.{pkg_name}'][str(pkg_version)] += 1
+            
+            # Environment variables - parse JSON field
+            env_vars = env.env_vars
+            if env_vars and isinstance(env_vars, dict):
+                for env_var_name, env_var_value in env_vars.items():
+                    # Skip very long values or sensitive data
+                    if len(str(env_var_value)) > 200:
+                        continue
+                    # Skip common sensitive environment variables
+                    if env_var_name.lower() in ['password', 'secret', 'key', 'token', 'auth']:
+                        continue
+                    cluster_configs[f'env_vars.{env_var_name}'][str(env_var_value)] += 1
         
         # Calculate significance scores
         for config_key, value_counts in cluster_configs.items():
@@ -203,26 +299,27 @@ class Command(BaseCommand):
                 occurrence_rate = count / cluster_size
                 
                 # Get global rate for this config value
-                global_rate = global_stats.get(config_key, {}).get(value, 0.01)  # Default to 1% if not found
+                # Default to 1% if not found globally - this ensures we can detect rare configurations
+                global_rate = global_stats.get(config_key, {}).get(value, 0.01)
                 
                 # Calculate significance (how much more common this is in the cluster vs globally)
-                if global_rate > 0:
-                    significance_score = occurrence_rate / global_rate
-                    
-                    # Only store patterns that are significantly more common in this cluster
-                    if significance_score > 1.5 and occurrence_rate > 0.3:  # 50% more common and appears in 30%+ of cluster
-                        ConfigPattern.objects.create(
-                            cluster=cluster_obj,
-                            config_key=config_key,
-                            config_value=value,
-                            occurrence_rate=occurrence_rate,
-                            global_rate=global_rate,
-                            significance_score=significance_score
-                        )
-                        patterns.append({
-                            'config_key': config_key,
-                            'config_value': value,
-                            'significance': significance_score
-                        })
+                # A high significance score means this config is much more common in error clusters
+                significance_score = occurrence_rate / global_rate
+                
+                # Only store patterns that are significantly more common in this cluster
+                if significance_score > 1.5 and occurrence_rate > 0.65:  # 50% more common and appears in 65%+ of cluster
+                    ConfigPattern.objects.create(
+                        cluster=cluster_obj,
+                        config_key=config_key,
+                        config_value=value,
+                        occurrence_rate=occurrence_rate,
+                        global_rate=global_rate,
+                        significance_score=significance_score
+                    )
+                    patterns.append({
+                        'config_key': config_key,
+                        'config_value': value,
+                        'significance': significance_score
+                    })
         
         return patterns
