@@ -10,7 +10,7 @@ class ConfigSuggestionService:
         # Load the model once for the entire class
         if ConfigSuggestionService._model is None:
             try:
-                ConfigSuggestionService._model = SentenceTransformer('all-MiniLM-L6-v2')
+                ConfigSuggestionService._model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
             except Exception as e:
                 print(f"Error loading SentenceTransformer model: {e}")
                 # Set a flag to indicate model loading failed
